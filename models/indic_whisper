@@ -1,0 +1,137 @@
+import os
+import torch
+import torchaudio
+import torchaudio.transforms as T
+from tempfile import NamedTemporaryFile
+from transformers import pipeline, AutoProcessor, WhisperForConditionalGeneration, GenerationConfig
+from pyannote.audio import Pipeline as DiarizationPipeline
+import time
+import json
+
+def format_timestamp(seconds: float) -> str:
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds - int(seconds)) * 1000)
+    return f"{hrs:02}:{mins:02}:{secs:02},{millis:03}"
+
+def generate_srt_and_json(segments, output_prefix):
+    srt_path = f"{output_prefix}.srt"
+    json_path = f"{output_prefix}.json"
+
+    with open(srt_path, "w", encoding="utf-8") as srt_file:
+        for idx, seg in enumerate(segments, 1):
+            srt_file.write(f"{idx}\n")
+            srt_file.write(f"{format_timestamp(seg['start'])} --> {format_timestamp(seg['end'])}\n")
+            srt_file.write(f"[{seg['speaker'].upper()}] {seg['text'].strip()}\n\n")
+
+    with open(json_path, "w", encoding="utf-8") as json_file:
+        json.dump(segments, json_file, ensure_ascii=False, indent=2)
+
+    return srt_path, json_path
+
+def run(audio_path, progress_callback=None, base_name="output"):
+    # Device setup
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    # Model path (local directory)
+    model_path = "models/hindi_models/whisper-large-hi-noldcil"    # download checkpoint from https://github.com/AI4Bharat/vistaar and place it in directory
+    lang_code = "hi"
+
+    # Verify that the model path exists locally
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model directory {model_path} does not exist. Please ensure the checkpoint is downloaded correctly.")
+
+    # Load Whisper model and processor from local path
+    model = WhisperForConditionalGeneration.from_pretrained(
+        model_path,
+        local_files_only=True  # Ensure only local files are used
+    ).to(device)
+    processor = AutoProcessor.from_pretrained(
+        model_path,
+        local_files_only=True
+    )
+
+    # Load generation config
+    generation_config = GenerationConfig.from_pretrained(
+        model_path,
+        local_files_only=True
+    )
+    if not hasattr(generation_config, "no_timestamps_token_id"):
+        generation_config.no_timestamps_token_id = 50363
+    model.generation_config = generation_config
+
+    # Initialize ASR pipeline
+    whisper_asr = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        device=0 if torch.cuda.is_available() else -1,
+        chunk_length_s=30,
+        stride_length_s=(5, 5),
+    )
+
+    # Set forced decoder ids based on language
+    if lang_code == 'or':
+        whisper_asr.model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language=None, task="transcribe")
+    else:
+        whisper_asr.model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language=lang_code, task="transcribe")
+
+    # Initialize pyannote speaker diarization pipeline
+    diarization_pipeline = DiarizationPipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+    diarization_result = diarization_pipeline(audio_path)
+
+    # Load audio for slicing
+    waveform, sample_rate = torchaudio.load(audio_path)
+    target_sample_rate = 16000
+    resampler = T.Resample(orig_freq=sample_rate, new_freq=target_sample_rate) if sample_rate != target_sample_rate else None
+
+    # Collect and sort segments
+    all_segments = []
+    for turn, _, speaker in diarization_result.itertracks(yield_label=True):
+        all_segments.append((turn, speaker))
+    all_segments.sort(key=lambda x: x[0].start)
+
+    transcript_segments = []
+    total_segments = len(all_segments)
+    start_time = time.time()
+
+    # Process each segment
+    for idx, (segment, speaker) in enumerate(all_segments, 1):
+        start_sample = int(segment.start * sample_rate)
+        end_sample = int(segment.end * sample_rate)
+        chunk = waveform[:, start_sample:end_sample]
+
+        if resampler:
+            chunk = resampler(chunk)
+
+        # Save temp chunk wav file
+        with NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+            torchaudio.save(tmp_wav.name, chunk, target_sample_rate)
+            temp_path = tmp_wav.name
+
+        # Run ASR on the chunk
+        result = whisper_asr(temp_path, return_timestamps=False)
+        os.remove(temp_path)
+
+        text = result.get("text", "").strip()
+        transcript_segments.append({
+            "start": segment.start,
+            "end": segment.end,
+            "speaker": speaker,
+            "text": text,
+        })
+
+        # Update progress
+        elapsed = time.time() - start_time
+        avg_time_per_segment = elapsed / idx
+        remaining_time = avg_time_per_segment * (total_segments - idx)
+
+        if progress_callback:
+            progress_callback(idx / total_segments, remaining_time)
+
+    # Generate SRT and JSON files
+    srt_path, json_path = generate_srt_and_json(transcript_segments, base_name)
+
+    return transcript_segments, srt_path, json_path
